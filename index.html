@@ -73,6 +73,24 @@
   #banner button { margin-left: auto; background: rgba(255,255,255,.2); border-color: rgba(255,255,255,.6); color: #fff; }
   #noticeBtn { display: none; position: fixed; right: 16px; bottom: 16px; z-index: 60; padding: 16px 22px; font-size: 18px; }
   #noticeBtn.show { display: block; }
+
+  /* Self-test overlay */
+  #st { position: fixed; inset: 0; z-index: 30; display: none; overflow: auto; background: var(--bg); padding: 20px 16px; }
+  #st.show { display: block; }
+  #st .card { max-width: 640px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+  #st h2 { margin: 0 0 12px; font-size: 24px; }
+  #st p, #st li { font-size: 17px; line-height: 1.5; }
+  #st ol { padding-left: 22px; }
+  #st .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+  #st .check { display: flex; gap: 10px; align-items: flex-start; font-size: 16px; margin-top: 14px; }
+  #st .check input { width: 22px; height: 22px; flex: none; margin-top: 2px; }
+  #st .waiting { text-align: center; padding: 40px 10px; }
+  #st .waiting .big { font-size: 26px; font-weight: 800; }
+  #st .answers { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 12px; }
+  #st .answers button { padding: 16px 10px; font-size: 17px; }
+  #st textarea { width: 100%; min-height: 110px; font: 13px ui-monospace, monospace; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); }
+  #st .code { font-size: 40px; font-weight: 900; letter-spacing: .12em; margin: 6px 0 14px; }
+  #st .warn { background: #fff3cd; color: #5c4400; border-radius: 10px; padding: 10px 12px; font-size: 15px; }
 </style>
 </head>
 <body>
@@ -81,6 +99,7 @@
   <h1>SoundSentry</h1>
   <span class="tag" id="versionTag">Version 1</span>
   <div class="status"><span class="dot" id="dot"></span><span id="statusText">Not listening</span></div>
+  <button id="stOpenBtn">Take the self-test</button>
   <button class="primary" id="startBtn">Start listening</button>
 </header>
 
@@ -146,6 +165,7 @@
 <div id="flash"><div class="big-icon" id="flashIcon"></div><div class="big-label" id="flashLabel"></div><div class="sub" id="flashSub"></div></div>
 <div id="banner"><span id="bannerIcon"></span><span id="bannerText"></span><button id="bannerClose">Dismiss</button></div>
 <button class="primary" id="noticeBtn">I noticed it</button>
+<div id="st" role="dialog" aria-modal="true" aria-label="SoundSentry self-test"><div class="card" id="stCard"></div></div>
 
 <script type="module">
 // ---------------------------------------------------------------------------
@@ -496,6 +516,195 @@ setInterval(() => {
   const s = Math.floor(ms / 1000);
   $("elapsed").textContent = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
 }, 500);
+
+// ---------------------------------------------------------------------------
+// Self-test: a guided version of the user test that a participant can do
+// alone. No microphone or sounds are used. The app shows 6 alerts per design
+// at random times; the participant taps when they notice each one and then
+// picks which sound it was. Results go to the survey form through a
+// pre-filled link.
+// ---------------------------------------------------------------------------
+const ST = {
+  ORDER: ["A", "B"],            // same order for everyone (change to random if counterbalancing)
+  PER_DESIGN: 6,
+  FIRST_WAIT: [10, 25],         // seconds before the first alert of a round
+  WAIT: [15, 40],               // seconds between alerts
+  MISS_AFTER: 10,               // seconds with no tap = missed
+  FORM: "https://docs.google.com/forms/d/e/1FAIpQLSfbi3yPofsdKqGswkmKxKpzuYTxyjg5mPUoysmWfLkChp5smA/viewform",
+  CODE_ENTRY: "entry.1332527951",
+  RESULTS_ENTRY: "entry.1055490519",
+};
+const st = { phase: "off", round: 0, queue: [], current: null, results: { A: [], B: [] }, extraTaps: 0,
+  hiddenCount: 0, timer: null, missTimer: null, code: "", wakeLock: null };
+const card = $("stCard");
+const DESIGN_NAME = { A: "Style A: red flash with the sound's name", B: "Style B: colored flash with an icon, then a banner" };
+
+function randBetween([a, b]) { return (a + Math.random() * (b - a)) * 1000; }
+function shuffle(arr) { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function makeCode() { const c = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; let s = ""; for (let i = 0; i < 4; i++) s += c[Math.floor(Math.random() * c.length)]; return s; }
+
+async function keepAwake() {
+  try { if ("wakeLock" in navigator && document.visibilityState === "visible") st.wakeLock = await navigator.wakeLock.request("screen"); } catch {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (st.phase === "off" || st.phase === "intro" || st.phase === "done") return;
+  if (document.visibilityState === "hidden") st.hiddenCount++;
+  else keepAwake();
+});
+
+function stShow(html) { card.innerHTML = html; $("st").classList.add("show"); $("st").scrollTop = 0; }
+
+function stIntro() {
+  if (state.listening) stop();
+  clearTimeout(st.timer); clearTimeout(st.missTimer);
+  Object.assign(st, { phase: "intro", round: 0, current: null, results: { A: [], B: [] }, extraTaps: 0, hiddenCount: 0, code: makeCode() });
+  stShow(`
+    <h2>SoundSentry self-test</h2>
+    <p>This test checks how easy it is to notice two styles of visual alert. It takes about 8 minutes and makes <b>no sound</b>.</p>
+    <ol>
+      <li>Put this phone or laptop beside you, about an arm's length away, with the screen facing you. Keep this page open.</li>
+      <li>Read a book, magazine, or anything on paper. Don't watch the screen.</li>
+      <li>At random times, the screen will flash an alert for a sound (like a smoke alarm or doorbell).</li>
+      <li>As soon as you notice an alert, <b>tap the screen</b> (or press the <b>space bar</b>), then choose which sound it was.</li>
+      <li>There are 2 rounds of 6 alerts, one for each alert style. At the end, you'll open the survey.</li>
+    </ol>
+    <p class="warn">The alerts flash 2 times per second. Do not take this test if you have epilepsy or have ever had a seizure caused by flashing lights.</p>
+    <label class="check"><input type="checkbox" id="stOk"> I do not have epilepsy and have never had a seizure caused by flashing lights.</label>
+    <div class="actions">
+      <button class="primary" id="stGo" disabled>Start the test</button>
+      <button id="stCancel">Cancel</button>
+    </div>`);
+  $("stOk").addEventListener("change", e => { $("stGo").disabled = !e.target.checked; });
+  $("stGo").addEventListener("click", () => { keepAwake(); stRoundIntro(); });
+  $("stCancel").addEventListener("click", stClose);
+}
+
+function stClose() {
+  clearTimeout(st.timer); clearTimeout(st.missTimer); closeAlert();
+  st.phase = "off"; $("st").classList.remove("show");
+  try { st.wakeLock && st.wakeLock.release(); } catch {}
+}
+
+function stRoundIntro() {
+  const design = ST.ORDER[st.round];
+  st.phase = "roundIntro";
+  stShow(`
+    <h2>Round ${st.round + 1} of 2</h2>
+    <p>This round uses <b>${DESIGN_NAME[design]}</b>. Tap "Show me an example" to see what it looks like. This one doesn't count.</p>
+    <div class="actions">
+      <button id="stSample">Show me an example</button>
+      <button class="primary" id="stBegin">I'm ready, start round ${st.round + 1}</button>
+    </div>`);
+  $("stSample").addEventListener("click", () => {
+    showFlash(TARGETS[Math.floor(Math.random() * TARGETS.length)], design);
+    setTimeout(closeAlert, 4500);
+  });
+  $("stBegin").addEventListener("click", () => { closeAlert(); stStartRound(); });
+}
+
+function stStartRound() {
+  st.queue = shuffle(TARGETS).slice(0, ST.PER_DESIGN);
+  stWaiting(ST.FIRST_WAIT);
+}
+
+function stWaiting(range) {
+  st.phase = "waiting";
+  const left = st.queue.length;
+  stShow(`
+    <div class="waiting">
+      <div class="big">Round ${st.round + 1}: keep reading</div>
+      <p>Tap the screen as soon as you notice an alert.</p>
+      <p>${left} alert${left === 1 ? "" : "s"} left in this round.</p>
+    </div>`);
+  st.timer = setTimeout(stFire, randBetween(range));
+}
+
+function stFire() {
+  const target = st.queue.shift();
+  const design = ST.ORDER[st.round];
+  st.phase = "alert";
+  st.current = { sound: target.id, design, shownAt: performance.now(), notice: null, answer: null };
+  showFlash(target, design);
+  st.missTimer = setTimeout(() => {
+    if (st.phase !== "alert") return;
+    closeAlert();
+    st.results[design].push(st.current);
+    stNext();
+  }, ST.MISS_AFTER * 1000);
+}
+
+function stNoticed() {
+  clearTimeout(st.missTimer);
+  st.current.notice = (performance.now() - st.current.shownAt) / 1000;
+  closeAlert();
+  st.phase = "question";
+  stShow(`
+    <h2>Which sound was the alert for?</h2>
+    <div class="answers">
+      ${TARGETS.map(t => `<button data-id="${t.id}">${t.icon} ${t.name}</button>`).join("")}
+      <button data-id="unsure">Not sure</button>
+    </div>`);
+  const readyAt = performance.now() + 600; // ignore the tail of the tap that registered "noticed"
+  card.querySelectorAll(".answers button").forEach(b => b.addEventListener("click", () => {
+    if (performance.now() < readyAt || !st.current) return;
+    st.current.answer = b.dataset.id;
+    st.results[st.current.design].push(st.current);
+    stNext();
+  }));
+}
+
+function stNext() {
+  st.current = null;
+  if (st.queue.length) return stWaiting(ST.WAIT);
+  st.round++;
+  if (st.round < ST.ORDER.length) return stRoundIntro();
+  stDone();
+}
+
+// A tap or the space bar while an alert is showing counts as "noticed".
+function stInput(e) {
+  if (st.phase === "alert") {
+    e.preventDefault(); e.stopPropagation();
+    stNoticed();
+  } else if (st.phase === "waiting") {
+    st.extraTaps++;
+  }
+}
+document.addEventListener("pointerdown", e => { if (st.phase === "alert" || st.phase === "waiting") stInput(e); }, true);
+document.addEventListener("keydown", e => { if (e.code === "Space" && (st.phase === "alert" || st.phase === "waiting")) stInput(e); }, true);
+
+function stResultsText() {
+  const part = d => d + ": " + st.results[d].map(r =>
+    r.sound + " " + (r.notice == null ? "miss" : r.notice.toFixed(2) + "s " + (r.answer === r.sound ? "right" : "wrong(" + r.answer + ")"))
+  ).join(", ");
+  const device = window.matchMedia("(pointer: coarse)").matches ? "touch" : "mouse";
+  return `SS1 order=${ST.ORDER.join("")} | ${part("A")} | ${part("B")} | extra_taps=${st.extraTaps} left_page=${st.hiddenCount} device=${device}`;
+}
+
+function stDone() {
+  st.phase = "done";
+  try { st.wakeLock && st.wakeLock.release(); } catch {}
+  const text = stResultsText();
+  const url = ST.FORM + "?usp=pp_url&" + ST.CODE_ENTRY + "=" + encodeURIComponent(st.code) + "&" + ST.RESULTS_ENTRY + "=" + encodeURIComponent(text);
+  stShow(`
+    <h2>Done, thank you!</h2>
+    <p>Your test code:</p>
+    <div class="code">${st.code}</div>
+    <p>Tap the button below to open the survey. Your code and results will already be filled in.</p>
+    <div class="actions"><a class="primary" id="stForm" href="${url}" target="_blank" rel="noopener"
+      style="text-decoration:none;display:inline-block;border-radius:10px;padding:12px 22px;font-weight:600;background:var(--accent);color:#fff;">Open the survey</a></div>
+    <p style="margin-top:22px;">If the results box in the survey is empty, copy this and paste it in:</p>
+    <textarea id="stText" readonly>${escapeHtml(text)}</textarea>
+    <div class="actions"><button id="stCopy">Copy results</button><button id="stClose">Close</button></div>`);
+  $("stCopy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(text); $("stCopy").textContent = "Copied"; }
+    catch { $("stText").select(); }
+  });
+  $("stClose").addEventListener("click", stClose);
+}
+
+$("stOpenBtn").addEventListener("click", stIntro);
+if (new URLSearchParams(location.search).get("selftest") === "1") stIntro();
 </script>
 </body>
 </html>
